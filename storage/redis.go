@@ -186,3 +186,67 @@ func (s *RedisStorage) playerKey(playerID string) string {
 	return fmt.Sprintf("player:%s", playerID)
 }
 
+// SaveMatch сохраняет матч для всех игроков
+func (s *RedisStorage) SaveMatch(ctx context.Context, match *models.Match) error {
+	matchJSON, err := json.Marshal(match)
+	if err != nil {
+		return fmt.Errorf("failed to marshal match: %w", err)
+	}
+
+	// Сохраняем матч для каждого игрока
+	for _, player := range match.Players {
+		matchKey := s.matchKey(player.ID)
+		err = s.client.Set(ctx, matchKey, matchJSON, 10*time.Minute).Err()
+		if err != nil {
+			s.logger.Warn("Failed to save match for player",
+				zap.String("player_id", player.ID),
+				zap.Error(err),
+			)
+			// Продолжаем для остальных игроков
+			continue
+		}
+	}
+
+	s.logger.Info("Match saved for all players",
+		zap.String("match_id", match.MatchID),
+		zap.Int("players_count", len(match.Players)),
+	)
+
+	return nil
+}
+
+// GetMatchByPlayerID возвращает матч для игрока
+func (s *RedisStorage) GetMatchByPlayerID(ctx context.Context, playerID string) (*models.Match, error) {
+	matchKey := s.matchKey(playerID)
+	
+	matchJSON, err := s.client.Get(ctx, matchKey).Result()
+	if err == redis.Nil {
+		return nil, fmt.Errorf("match not found")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get match: %w", err)
+	}
+
+	var match models.Match
+	if err := json.Unmarshal([]byte(matchJSON), &match); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal match: %w", err)
+	}
+
+	return &match, nil
+}
+
+// matchKey возвращает ключ для матча игрока
+func (s *RedisStorage) matchKey(playerID string) string {
+	return fmt.Sprintf("match:%s", playerID)
+}
+
+// RemoveMatch удаляет матч для игрока (опционально, для очистки)
+func (s *RedisStorage) RemoveMatch(ctx context.Context, playerID string) error {
+	matchKey := s.matchKey(playerID)
+	err := s.client.Del(ctx, matchKey).Err()
+	if err != nil {
+		return fmt.Errorf("failed to delete match: %w", err)
+	}
+	return nil
+}
+

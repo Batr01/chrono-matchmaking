@@ -32,7 +32,19 @@ func DefaultMatcherConfig() *MatcherConfig {
 		MaxRatingDiff:      200,           // Начальная разница рейтинга
 		MaxSearchTime:      5 * time.Minute, // Максимальное время поиска
 		RatingExpansionRate: 50,           // +50 рейтинга каждые 30 секунд
-		PlayersPerMatch:    6,             // 3x3 матч (6 игроков)
+		PlayersPerMatch:    6,             // 3x3 матч (6 игроков) - используется как значение по умолчанию
+	}
+}
+
+// GetPlayersPerMatch возвращает количество игроков для режима игры
+func GetPlayersPerMatch(gameMode string) int {
+	switch gameMode {
+	case "1v1":
+		return 2 // 1 игрок против 1 игрока
+	case "3v3":
+		return 6 // 3 игрока против 3 игроков
+	default:
+		return 6 // По умолчанию 3v3
 	}
 }
 
@@ -50,11 +62,25 @@ func NewMatcherService(storage *storage.RedisStorage, logger *zap.Logger, config
 
 // FindMatch пытается найти матч для игрока
 func (s *MatcherService) FindMatch(ctx context.Context, playerID string) (*models.Match, error) {
+	// Сначала проверяем, есть ли уже сохраненный матч для этого игрока
+	savedMatch, err := s.storage.GetMatchByPlayerID(ctx, playerID)
+	if err == nil && savedMatch != nil {
+		// Матч уже найден и сохранен
+		s.logger.Info("Returning saved match",
+			zap.String("match_id", savedMatch.MatchID),
+			zap.String("player_id", playerID),
+		)
+		return savedMatch, nil
+	}
+
 	// Получаем игрока по ID
 	currentPlayer, err := s.storage.GetPlayerByID(ctx, playerID)
 	if err != nil {
 		return nil, fmt.Errorf("player not found in queue: %w", err)
 	}
+
+	// Определяем количество игроков для данного режима
+	playersPerMatch := GetPlayersPerMatch(currentPlayer.GameMode)
 
 	// Вычисляем динамический диапазон рейтинга на основе времени ожидания
 	waitTime := time.Since(currentPlayer.JoinedAt)
@@ -67,7 +93,7 @@ func (s *MatcherService) FindMatch(ctx context.Context, playerID string) (*model
 		currentPlayer.GameMode,
 		currentPlayer.Rating-ratingRange,
 		currentPlayer.Rating+ratingRange,
-		int64(s.config.PlayersPerMatch*2), // Берем больше кандидатов для фильтрации
+		int64(playersPerMatch*2), // Берем больше кандидатов для фильтрации
 	)
 
 	if err != nil {
@@ -75,7 +101,7 @@ func (s *MatcherService) FindMatch(ctx context.Context, playerID string) (*model
 	}
 
 	// Фильтруем кандидатов (исключаем самого игрока и проверяем совместимость)
-	matchPlayers := make([]models.Player, 0, s.config.PlayersPerMatch)
+	matchPlayers := make([]models.Player, 0, playersPerMatch)
 	matchPlayers = append(matchPlayers, *currentPlayer)
 
 	for _, candidate := range candidates {
@@ -85,18 +111,26 @@ func (s *MatcherService) FindMatch(ctx context.Context, playerID string) (*model
 
 		if s.isCompatible(currentPlayer, candidate) {
 			matchPlayers = append(matchPlayers, *candidate)
-			if len(matchPlayers) >= s.config.PlayersPerMatch {
+			if len(matchPlayers) >= playersPerMatch {
 				break
 			}
 		}
 	}
 
 	// Если нашли достаточно игроков, создаем матч
-	if len(matchPlayers) >= s.config.PlayersPerMatch {
+	if len(matchPlayers) >= playersPerMatch {
 		match := &models.Match{
 			MatchID:   fmt.Sprintf("match_%d", time.Now().UnixNano()),
 			Players:   matchPlayers,
 			CreatedAt: time.Now(),
+		}
+
+		// Сохраняем матч для всех игроков ПЕРЕД удалением из очереди
+		if err := s.storage.SaveMatch(ctx, match); err != nil {
+			s.logger.Warn("Failed to save match",
+				zap.String("match_id", match.MatchID),
+				zap.Error(err),
+			)
 		}
 
 		// Удаляем игроков из очереди
@@ -165,17 +199,20 @@ func (s *MatcherService) GetQueueSize(ctx context.Context, region, gameMode stri
 
 // ProcessQueue обрабатывает очередь и пытается найти матчи
 func (s *MatcherService) ProcessQueue(ctx context.Context, region, gameMode string) error {
+	// Определяем количество игроков для данного режима
+	playersPerMatch := GetPlayersPerMatch(gameMode)
+
 	// Получаем всех игроков в очереди для данного региона и режима
 	players, err := s.storage.GetPlayersInRange(ctx, region, gameMode, 0, math.MaxInt, 100)
 	if err != nil {
 		return fmt.Errorf("failed to get players: %w", err)
 	}
 
-	if len(players) < s.config.PlayersPerMatch {
+	if len(players) < playersPerMatch {
 		return nil // Недостаточно игроков для создания матча
 	}
 
-	// Используем алгоритм жадного поиска для формирования групп из 6 игроков
+	// Используем алгоритм жадного поиска для формирования групп
 	used := make(map[string]bool) // Отслеживаем использованных игроков
 
 	for i := 0; i < len(players); i++ {
@@ -188,7 +225,7 @@ func (s *MatcherService) ProcessQueue(ctx context.Context, region, gameMode stri
 		used[players[i].ID] = true
 
 		// Ищем совместимых игроков для группы
-		for j := 0; j < len(players) && len(group) < s.config.PlayersPerMatch; j++ {
+		for j := 0; j < len(players) && len(group) < playersPerMatch; j++ {
 			if used[players[j].ID] {
 				continue
 			}
@@ -201,7 +238,7 @@ func (s *MatcherService) ProcessQueue(ctx context.Context, region, gameMode stri
 		}
 
 		// Если собрали группу из нужного количества игроков, создаем матч
-		if len(group) >= s.config.PlayersPerMatch {
+		if len(group) >= playersPerMatch {
 			matchPlayers := make([]models.Player, 0, len(group))
 			for _, p := range group {
 				matchPlayers = append(matchPlayers, *p)
@@ -211,6 +248,14 @@ func (s *MatcherService) ProcessQueue(ctx context.Context, region, gameMode stri
 				MatchID:   fmt.Sprintf("match_%d", time.Now().UnixNano()),
 				Players:   matchPlayers,
 				CreatedAt: time.Now(),
+			}
+
+			// Сохраняем матч для всех игроков ПЕРЕД удалением из очереди
+			if err := s.storage.SaveMatch(ctx, match); err != nil {
+				s.logger.Warn("Failed to save match",
+					zap.String("match_id", match.MatchID),
+					zap.Error(err),
+				)
 			}
 
 			// Удаляем игроков из очереди

@@ -111,7 +111,7 @@ func main() {
 			case <-ticker.C:
 				// Обрабатываем очереди для разных регионов и режимов
 				regions := []string{"EU", "US", "ASIA"}
-				gameModes := []string{"ranked", "casual"}
+				gameModes := []string{"1v1", "3v3"}
 
 				for _, region := range regions {
 					for _, gameMode := range gameModes {
