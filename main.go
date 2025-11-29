@@ -61,6 +61,11 @@ func main() {
 	// Инициализация сервиса матчмейкинга
 	matcherConfig := service.DefaultMatcherConfig()
 	matcherService := service.NewMatcherService(redisStorage, logger, matcherConfig)
+	
+	// Настройка URL game-service из переменной окружения
+	gameServiceURL := getEnv("GAME_SERVICE_URL", "http://localhost:8081")
+	matcherService.SetGameServiceURL(gameServiceURL)
+	logger.Info("Game service URL configured", zap.String("url", gameServiceURL))
 
 	// Инициализация HTTP handlers
 	queueHandler := handler.NewQueueHandler(matcherService, logger)

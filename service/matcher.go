@@ -1,9 +1,12 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
 	"time"
 
 	"chrono-matchmaking/models"
@@ -13,9 +16,10 @@ import (
 
 // MatcherService управляет логикой поиска матчей
 type MatcherService struct {
-	storage *storage.RedisStorage
-	logger  *zap.Logger
-	config  *MatcherConfig
+	storage      *storage.RedisStorage
+	logger       *zap.Logger
+	config       *MatcherConfig
+	gameServiceURL string // URL game-service для создания лобби
 }
 
 // MatcherConfig конфигурация матчмейкера
@@ -54,10 +58,16 @@ func NewMatcherService(storage *storage.RedisStorage, logger *zap.Logger, config
 		config = DefaultMatcherConfig()
 	}
 	return &MatcherService{
-		storage: storage,
-		logger:  logger,
-		config:  config,
+		storage:        storage,
+		logger:         logger,
+		config:         config,
+		gameServiceURL: "http://localhost:8081", // По умолчанию, можно изменить через SetGameServiceURL
 	}
+}
+
+// SetGameServiceURL устанавливает URL game-service
+func (s *MatcherService) SetGameServiceURL(url string) {
+	s.gameServiceURL = url
 }
 
 // FindMatch пытается найти матч для игрока
@@ -147,6 +157,15 @@ func (s *MatcherService) FindMatch(ctx context.Context, playerID string) (*model
 			zap.String("match_id", match.MatchID),
 			zap.Int("players_count", len(matchPlayers)),
 		)
+
+		// Создаем лобби в game-service
+		if err := s.createLobbyInGameService(ctx, match); err != nil {
+			s.logger.Warn("Failed to create lobby in game-service",
+				zap.String("match_id", match.MatchID),
+				zap.Error(err),
+			)
+			// Не возвращаем ошибку, так как матч уже создан
+		}
 
 		return match, nil
 	}
@@ -275,6 +294,14 @@ func (s *MatcherService) ProcessQueue(ctx context.Context, region, gameMode stri
 				zap.String("game_mode", gameMode),
 			)
 
+			// Создаем лобби в game-service
+			if err := s.createLobbyInGameService(ctx, match); err != nil {
+				s.logger.Warn("Failed to create lobby in game-service",
+					zap.String("match_id", match.MatchID),
+					zap.Error(err),
+				)
+			}
+
 			// Продолжаем поиск для остальных игроков
 			continue
 		}
@@ -285,6 +312,65 @@ func (s *MatcherService) ProcessQueue(ctx context.Context, region, gameMode stri
 		}
 		delete(used, group[0].ID) // Освобождаем и первого, чтобы попробовать другие комбинации
 	}
+
+	return nil
+}
+
+// createLobbyInGameService создает лобби в game-service для найденного матча
+func (s *MatcherService) createLobbyInGameService(ctx context.Context, match *models.Match) error {
+	// Определяем Unity сцену в зависимости от режима игры
+	// Для 1v1 используем "SampleScene", для других режимов можно настроить
+	unityScene := "SampleScene" // По умолчанию для всех режимов
+	if len(match.Players) == 2 {
+		// Это 1v1 матч
+		unityScene = "SampleScene"
+	}
+
+	// Собираем ID игроков
+	playerIDs := make([]string, 0, len(match.Players))
+	for _, player := range match.Players {
+		playerIDs = append(playerIDs, player.ID)
+	}
+
+	// Формируем запрос
+	requestBody := map[string]interface{}{
+		"match_id":    match.MatchID,
+		"player_ids":  playerIDs,
+		"unity_scene": unityScene,
+	}
+
+	jsonData, err := json.Marshal(requestBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Выполняем HTTP запрос к game-service
+	url := s.gameServiceURL + "/api/v1/lobby/create-from-match"
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("game-service returned status %d", resp.StatusCode)
+	}
+
+	s.logger.Info("Lobby created in game-service",
+		zap.String("match_id", match.MatchID),
+		zap.String("unity_scene", unityScene),
+	)
 
 	return nil
 }
